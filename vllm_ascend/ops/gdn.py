@@ -35,7 +35,10 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
-from vllm_ascend.ops.rearrange_qkv import rearrange_mixed_qkv
+from vllm_ascend.ops.rearrange_qkv import (
+    rearrange_mixed_qkv,
+    rearrange_mixed_qkv_and_fused_gdn_gating,
+)
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -431,11 +434,28 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = rearrange_mixed_qkv(self, mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = rearrange_mixed_qkv(self, mixed_qkv_non_spec)
-
-        # 2. Recurrent attention
-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        # 1.5: Rearrange the mixed QKV and compute the gating. The fused
+        # kernels run the DMA rearrange on the cube cores while the vector
+        # cores compute the gating in parallel. A batch that mixes spec and
+        # non-spec tokens rearranges twice, so the gating rows no longer match
+        # a single rearrange input and the fused kernel is skipped.
+        fuse_gating = (mixed_qkv_spec is None) != (mixed_qkv_non_spec is None)
+        if fuse_gating:
+            fused_input = mixed_qkv_non_spec if mixed_qkv_spec is None else mixed_qkv_spec
+            query, key, value, g, beta = rearrange_mixed_qkv_and_fused_gdn_gating(
+                self, fused_input, self.A_log, a, b, self.dt_bias
+            )
+            if mixed_qkv_spec is None:
+                query_non_spec, key_non_spec, value_non_spec = query, key, value
+                query_spec = key_spec = value_spec = None
+            else:
+                query_spec, key_spec, value_spec = query, key, value
+                query_non_spec = key_non_spec = value_non_spec = None
+        else:
+            query_spec, key_spec, value_spec = rearrange_mixed_qkv(self, mixed_qkv_spec)
+            query_non_spec, key_non_spec, value_non_spec = rearrange_mixed_qkv(self, mixed_qkv_non_spec)
+            # 2. Recurrent attention
+            g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g
