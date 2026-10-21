@@ -316,7 +316,11 @@ def merge_dsa_dcp_indexer_topk(
     along a new rank dimension, the local indices are mapped to global
     compressed coordinates (the mapping is request-relative, so it applies
     uniformly to every query row), and the global top-k is taken by score
-    (ties resolved deterministically by index order).
+    (ties retain the rank-major candidate order on every rank).
+
+    DSV4's 512/1024 BF16 scores are bit-packed in pairs into INT32 words,
+    alongside INT32 indices. One candidate costs six wire bytes and the
+    fixed-size payload uses a single all-gather, including padding slots.
 
     ``valid_mask`` marks candidates whose local index is inside the request's
     rank-local compressed length.  Ranks owning no part of a short request
@@ -328,7 +332,7 @@ def merge_dsa_dcp_indexer_topk(
     """
     topk = local_topk_indices.shape[-1]
     flat_idx = local_topk_indices.reshape(-1, topk).to(torch.int64)
-    flat_val = local_topk_values.reshape(-1, topk).to(torch.float32)
+    flat_val = local_topk_values.reshape(-1, topk)
     global_idx = dsa_dcp_local_cmp_to_global(
         flat_idx,
         dcp_group.world_size,
@@ -338,22 +342,28 @@ def merge_dsa_dcp_indexer_topk(
         storage_block_size,
     )
     sane = (flat_idx >= 0) & valid_mask.reshape(flat_idx.shape).to(torch.bool)
-    global_idx = torch.where(sane, global_idx, torch.full_like(global_idx, -1))
+    global_idx = torch.where(sane, global_idx, torch.full_like(global_idx, -1)).to(torch.int32)
     scores = torch.where(sane, flat_val, torch.full_like(flat_val, float("-inf")))
-    packed = torch.stack([scores, global_idx.to(torch.float32)], dim=-1).unsqueeze(0)
+    # Reinterpret the BF16 bits, never numerically cast scores to integers
+    # or indices to BF16. K indices + K/2 score words per query row.
+    score_words = scores.contiguous().view(torch.int32)
+    packed = torch.cat([global_idx, score_words], dim=-1).unsqueeze(0)
     gathered = dcp_group.all_gather(packed.contiguous(), dim=0)
-    # [dcp, rows, topk, 2] -> [rows, dcp * topk, 2]
     rows = packed.shape[1]
-    gathered = gathered.permute(1, 0, 2, 3).reshape(rows, dcp_group.world_size * topk, 2)
-    all_scores = gathered[..., 0]
-    all_indices = gathered[..., 1].to(torch.int64)
+    all_indices = gathered[..., :topk].permute(1, 0, 2).reshape(rows, dcp_group.world_size * topk)
+    all_scores = (
+        gathered[..., topk:]
+        .contiguous()
+        .view(torch.bfloat16)
+        .permute(1, 0, 2)
+        .reshape(rows, dcp_group.world_size * topk)
+        .to(torch.float32)
+    )
     topk_order = torch.argsort(-all_scores, dim=-1, stable=True)[..., :topk]
     merged = torch.gather(all_indices, dim=-1, index=topk_order)
     selected_scores = torch.gather(all_scores, dim=-1, index=topk_order)
     # Garbage slots never carry a real index into the attention op.
-    merged = torch.where(
-        torch.isfinite(selected_scores), merged, torch.full_like(merged, -1)
-    )
+    merged = torch.where(torch.isfinite(selected_scores), merged, torch.full_like(merged, -1))
     return merged.reshape(local_topk_indices.shape).to(local_topk_indices.dtype)
 
 
@@ -1182,7 +1192,7 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             f"  requests: n_req={g_cmp.shape[0]}",
             f"    req_global_cmp={g_cmp.tolist()}   (request total compressed tokens)",
             f"    req_local_cmp ={l_cmp.tolist()}   (tokens stored ON THIS card)",
-            f"  per-card cache sizes:",
+            "  per-card cache sizes:",
             f"    compress_kv_cache = {_mb(compress_kv_cache)}",
             f"    swa_kv_cache      = {_mb(swa_kv_cache)}",
             f"    state_cache       = {_mb(state_cache)}",

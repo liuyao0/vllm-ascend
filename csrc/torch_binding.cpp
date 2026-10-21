@@ -1305,12 +1305,11 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_compat_npu(
     int64_t mask_mode, int64_t cmp_ratio, int64_t return_value,
     const c10::optional<at::Tensor> &dcp_context)
 {
-    TORCH_CHECK(return_value == 0, "npu_quant_lightning_indexer_v2 only supports return_value=0");
-    auto outputs = qli_v2::QuantLightningIndexerCandidate(
+    auto outputs = qli_v2::QuantLightningIndexerCandidateImpl(
         query, key, weights, query_dequant_scale, key_dequant_scale, topk, quant_mode,
         c10::nullopt, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k,
         block_table, output_idx_offset, metadata, max_seqlen_q, layout_q, layout_k,
-        mask_mode, cmp_ratio, 3, 2048, 8, dcp_context);
+        mask_mode, cmp_ratio, 3, 2048, 8, dcp_context, return_value);
     return {std::get<0>(outputs), std::get<1>(outputs)};
 }
 

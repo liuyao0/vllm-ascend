@@ -187,12 +187,6 @@ class IndexerOverlapPlan:
     aux_stream: torch.npu.Stream | None = None
 
 
-# Latched when the installed _C_ascend / hardware rejects return_value=1
-# (e.g. 910B tiling only supports return_value=False); later calls skip the
-# failing attempt and recompute the selected scores in torch instead.
-_QLI_RETURN_VALUE_UNSUPPORTED = False
-
-
 class AscendIndexerOps:
     def __init__(self, index_topk: int) -> None:
         from vllm_ascend.device.device_op import DeviceOperator
@@ -242,125 +236,33 @@ class AscendIndexerOps:
         metadata: typing.Any,
         return_values: bool = False,
     ):
-        global _QLI_RETURN_VALUE_UNSUPPORTED
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(metadata.qli_metadata))
         prepared_weights = self.device_operator.prepare_dsa_indexer_weights(weights)
         prepared_query_scale = self.device_operator.prepare_dsa_indexer_query_scale(query_scale)
         prepared_key_scale = self.device_operator.prepare_dsa_indexer_key_scale(scale_cache)
-
-        def _run(return_value: int):
-            return torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
-                query=query,
-                key=key_cache,
-                weights=prepared_weights,
-                query_dequant_scale=prepared_query_scale,
-                key_dequant_scale=prepared_key_scale,
-                topk=self.index_topk,
-                quant_mode=self.device_operator.get_dsa_indexer_quant_mode(),
-                cu_seqlens_q=metadata.qli_cu_seqlens_q,
-                seqused_k=metadata.qli_seqused_k,
-                cmp_residual_k=metadata.qli_cmp_residual_k,
-                block_table=metadata.block_table,
-                metadata=metadata.qli_metadata,
-                layout_q="TND",
-                layout_k="PA_BBND",
-                mask_mode=3,
-                cmp_ratio=4,
-                return_value=return_value,
-                dcp_context=metadata.dcp_causal_context,
-            )
-
-        if return_values and not _QLI_RETURN_VALUE_UNSUPPORTED:
-            try:
-                topk_idxs, topk_vals = _run(1)
-                return topk_idxs, topk_vals
-            except RuntimeError as e:
-                message = str(e)
-                if "returnValue" not in message and "return_value" not in message:
-                    raise
-                # This build/hardware rejects return_value=1 (e.g. 910B tiling
-                # only supports return_value=False); fall back to selecting
-                # without scores and recomputing them in torch.
-                _QLI_RETURN_VALUE_UNSUPPORTED = True
-        topk_idxs, _ = _run(0)
+        topk_idxs, topk_vals = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
+            query=query,
+            key=key_cache,
+            weights=prepared_weights,
+            query_dequant_scale=prepared_query_scale,
+            key_dequant_scale=prepared_key_scale,
+            topk=self.index_topk,
+            quant_mode=self.device_operator.get_dsa_indexer_quant_mode(),
+            cu_seqlens_q=metadata.qli_cu_seqlens_q,
+            seqused_k=metadata.qli_seqused_k,
+            cmp_residual_k=metadata.qli_cmp_residual_k,
+            block_table=metadata.block_table,
+            metadata=metadata.qli_metadata,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=4,
+            return_value=int(return_values),
+            dcp_context=metadata.dcp_causal_context,
+        )
         if return_values:
-            topk_vals = self._compute_topk_values_torch(
-                query,
-                prepared_weights,
-                prepared_query_scale,
-                key_cache,
-                scale_cache,
-                metadata,
-                topk_idxs,
-            )
             return topk_idxs, topk_vals
         return topk_idxs
-
-    def _compute_topk_values_torch(
-        self,
-        query: torch.Tensor,
-        prepared_weights: torch.Tensor,
-        prepared_query_scale: torch.Tensor,
-        key_cache: torch.Tensor,
-        scale_cache: torch.Tensor,
-        metadata: typing.Any,
-        topk_idxs: torch.Tensor,
-    ) -> torch.Tensor:
-        """Recompute indexer scores at the selected candidate positions.
-
-        The 910B tiling of ``npu_quant_lightning_indexer_v2`` only supports
-        ``return_value=False``, but DCP needs per-candidate scores to merge
-        the exact global top-k. This mirrors the operator's int8 scoring
-        (see the quant_lightning_indexer_v2 golden):
-            score[t, c] = k_scale[c] * sum_h (w[t, h] * q_scale[t, h])
-                          * max(sum_d q_int8[t, h, d] * k_int8[c, d] / 1024, 0)
-        evaluated only at the selected positions. The per-rank top-k sets
-        stay exact; the recomputed values only rank the merged candidates.
-        """
-        if self.device_operator.get_dsa_indexer_quant_mode() != 2:
-            raise NotImplementedError(
-                "torch top-k value fallback only implements the int8 indexer quant mode"
-            )
-        # The op returns [T, 1, topk] (singleton k-head dim); flatten to rows
-        # and restore the indices' shape on the way out (the DCP merge
-        # reshapes both to [-1, topk] anyway).
-        idx_shape = topk_idxs.shape
-        topk = idx_shape[-1]
-        topk_idxs = topk_idxs.reshape(-1, topk)
-        rows = topk_idxs.shape[0]
-        values = torch.empty((rows, topk), dtype=torch.float32, device=query.device)
-        if rows == 0:
-            return values.reshape(idx_shape)
-        cu_seqlens_q = metadata.qli_cu_seqlens_q.to(torch.int64)
-        block_table = metadata.block_table.to(torch.int64)
-        token_reqs = torch.searchsorted(
-            cu_seqlens_q[1:], torch.arange(rows, device=cu_seqlens_q.device), right=True
-        ).clamp_(max=block_table.shape[0] - 1)
-        positions_per_block = key_cache.shape[1]
-        max_position = positions_per_block * block_table.shape[1]
-        # cur_w[t, h] = w[t, h] * q_scale[t, h] (golden computes the product
-        # in fp16 before the fp32 weighted sum).
-        weights_f32 = (
-            prepared_weights.reshape(rows, -1) * prepared_query_scale.reshape(rows, -1)
-        ).to(torch.float32)
-        q_f32 = query.to(torch.float32)
-        # Chunk over rows to bound the [chunk, H, topk] fp32 intermediates.
-        for start in range(0, rows, 128):
-            end = min(start + 128, rows)
-            idx = topk_idxs[start:end].to(torch.int64).clamp_(0, max_position - 1)
-            block_ids = torch.gather(
-                block_table[token_reqs[start:end]],
-                1,
-                torch.div(idx, positions_per_block, rounding_mode="floor"),
-            )
-            offsets = idx % positions_per_block
-            k_rows = key_cache[block_ids, offsets].reshape(end - start, topk, -1).to(torch.float32)
-            k_scale = scale_cache[block_ids, offsets].reshape(end - start, topk).to(torch.float32)
-            qk = torch.bmm(q_f32[start:end], k_rows.transpose(1, 2))
-            qk_relu = (qk / 1024.0).clamp_min(0.0).to(torch.float16).to(torch.float32)
-            weighted = torch.bmm(weights_f32[start:end].unsqueeze(1), qk_relu)
-            values[start:end] = weighted.squeeze(1) * k_scale
-        return values.reshape(idx_shape)
 
     def quantize_update_cache_and_select_topk(
         self,
@@ -552,9 +454,7 @@ class DeepseekV4Indexer(nn.Module):
         sin = cache_metadata.sin[layer_name][:num_tokens]
         aux_stream = overlap_plan.aux_stream
         if return_topk_values and (self.skip_topk or aux_stream is not None):
-            raise NotImplementedError(
-                "return_topk_values is only supported on the serial non-skip_topk path."
-            )
+            raise NotImplementedError("return_topk_values is only supported on the serial non-skip_topk path.")
         if self.skip_topk:
             topk_indices = self._get_cached_topk_indices(num_tokens)
         elif aux_stream is not None:

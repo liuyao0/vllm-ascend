@@ -123,6 +123,7 @@ protected:
     GlobalTensor<uint32_t> metadataGm;
     GlobalTensor<int32_t> dcpContextGm;
     GlobalTensor<int32_t> indiceOutGm;
+    GlobalTensor<bfloat16_t> valueOutGm;
     GlobalTensor<int32_t> candidateTopkIndexInGm;
     GlobalTensor<int32_t> candidateTopkIndexOutGm;
     GlobalTensor<int32_t> blockTableGm;
@@ -187,6 +188,7 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::InitTilingData(const QLIV2TilingDat
     constInfo.keyStride0 = tilingData->keyStride0;                     // A11: key 0轴非连续
     constInfo.keyDequantScaleStride0 = tilingData->keyDequantScaleStride0;
     constInfo.sparseCount = tilingData->sparseCount;
+    constInfo.returnValue = tilingData->returnValue != 0;
     constInfo.cmpRatio = tilingData->cmpRatio;
     constInfo.outputLayout = Q_LAYOUT_T; // 输出和输入形状一致
     if constexpr (Q_LAYOUT_T == LI_LAYOUT::TND) {
@@ -516,6 +518,9 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, ldInfo, tiling);
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
+        if (constInfo.returnValue) {
+            valueOutGm.SetGlobalBuffer((__gm__ bfloat16_t *)sparseValues);
+        }
         weightsGm.SetGlobalBuffer((__gm__ half *)weights);
         qScaleGm.SetGlobalBuffer((__gm__ half *)queryScale);
         kScaleGm.SetGlobalBuffer((__gm__ half *)keyScale);
@@ -531,7 +536,7 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
         }
         // A15: 有效标志须与 tensor 一并传给 vector (InitParams 已先值拷贝 constInfo, 此处再改标志不生效)
         bool outputIdxOffsetValid = (outputIdxOffset != nullptr);
-        vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, blockTableGm);
+        vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, valueOutGm, blockTableGm);
         vectorService.InitVecCandidateTensor(candidateTopkIndexInGm, candidateTopkIndexOutGm, outputIdxOffsetGm,
                                              outputIdxOffsetValid);
         vectorService.InitVecWorkspaceTensor(weightWorkspaceGm, mm1ResGm, vec1ResGm);
