@@ -21,6 +21,7 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "quant_lightning_indexer_v2_common_arch22.h"
+#include "quant_lightning_indexer_v2_candidate_schedule.h"
 
 namespace QLIV2Kernel {
 using namespace QLIV2Common;
@@ -43,6 +44,10 @@ public:
                                                const GlobalTensor<Q_T> &queryGm, const GlobalTensor<float> &mm1ResGm,
                                                const GlobalTensor<half> &weightWorkspaceGm);
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
+    __aicore__ inline void InitCandidateTensor(const GlobalTensor<int32_t> &candidates)
+    {
+        candidatesGm_ = candidates;
+    }
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void ComputeMm1(const QLIV2Common::RunInfo &runInfo);
@@ -102,6 +107,7 @@ private:
     static constexpr LI_LAYOUT Q_LAYOUT_T = QLIV2T::layout;
     static constexpr LI_LAYOUT K_LAYOUT_T = QLIV2T::keyLayout;
     GlobalTensor<int32_t> blkTableGm_;
+    GlobalTensor<int32_t> candidatesGm_;
     GlobalTensor<K_T> keyGm_;
     GlobalTensor<Q_T> queryGm_;
     GlobalTensor<half> weightGm_;
@@ -316,6 +322,100 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::KeyNd2NzForPA(uint64_t s2L1RealSize,
                              static_cast<uint64_t>(constInfo_.keyStride0) :
                              static_cast<uint64_t>(constInfo_.kCacheBlockSize) * constInfo_.kHeadNum *
                                  constInfo_.headDim;
+    if (constInfo_.candidateMode == CANDIDATE_MODE_PACKED) {
+        // Same membership plan, with K materialized once in plan order.
+        uint64_t group = runInfo.candidateOutOffset / QLIV2Candidate::GROUP_STRIDE;
+        uint64_t first = runInfo.candidateOutOffset % QLIV2Candidate::GROUP_STRIDE - QLIV2Candidate::GROUP_HEADER;
+        uint64_t token = (group * QLIV2Candidate::GROUP_CAPACITY + first) * QLIV2Candidate::BLOCK + s2GmOffset;
+        Nd2NzParams params;
+        params.ndNum = 1;
+        params.nValue = s2L1RealSize;
+        params.dValue = params.srcDValue = constInfo_.headDim;
+        params.srcNdMatrixStride = params.dstNzMatrixStride = 0;
+        params.dstNzC0Stride = CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE);
+        params.dstNzNStride = 1;
+        DataCopy(keyL1_[(keyL1BufIdx_ % DOUBLE_BUF_NUM) * KEY_BUFFER_OFFSET],
+                 keyGm_[token * constInfo_.headDim], params);
+        return;
+    }
+    if ((false /* retired experimental path */ || constInfo_.candidateMode == CANDIDATE_MODE_PACKED)) {
+        // The plan contains paged physical token starts. Coalesce neighboring
+        // blocks; pair remaining positive-stride blocks in one ND2NZ command.
+        uint64_t physicalBase = runInfo.candidateOutOffset + 2 * QLIV2Candidate::GROUP_CAPACITY;
+        Nd2NzParams params;
+        params.dValue = params.srcDValue = constInfo_.headDim;
+        params.dstNzC0Stride = CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE);
+        params.dstNzNStride = 1;
+        while (s2L1Offset < s2L1RealSize) {
+            uint32_t slot = (s2GmOffset + s2L1Offset) / QLIV2Candidate::BLOCK;
+            int32_t physical = candidatesGm_.GetValue(physicalBase + slot);
+            if (physical < 0) {
+                s2L1Offset += QLIV2Candidate::BLOCK;
+                continue;
+            }
+            uint64_t offset = static_cast<uint64_t>(physical / constInfo_.kCacheBlockSize) * blkStride +
+                              (physical % constInfo_.kCacheBlockSize) * constInfo_.headDim;
+            uint32_t run = QLIV2Candidate::BLOCK;
+            while (s2L1Offset + run < s2L1RealSize) {
+                int32_t next = candidatesGm_.GetValue(physicalBase + slot + run / QLIV2Candidate::BLOCK);
+                if (next != physical + static_cast<int32_t>(run) ||
+                    next / constInfo_.kCacheBlockSize != physical / constInfo_.kCacheBlockSize) {
+                    break;
+                }
+                run += QLIV2Candidate::BLOCK;
+            }
+            params.ndNum = 1;
+            params.nValue = run;
+            params.srcNdMatrixStride = params.dstNzMatrixStride = 0;
+            if (run == QLIV2Candidate::BLOCK && s2L1Offset + 2 * run <= s2L1RealSize) {
+                int32_t next = candidatesGm_.GetValue(physicalBase + slot + 1);
+                if (next >= 0) {
+                    uint64_t nextOffset = static_cast<uint64_t>(next / constInfo_.kCacheBlockSize) * blkStride +
+                                          (next % constInfo_.kCacheBlockSize) * constInfo_.headDim;
+                    // The Ascend 910B multi-ND source stride is limited to 16 bits.
+                    if (nextOffset > offset && nextOffset - offset <= 65535) {
+                        params.ndNum = 2;
+                        params.srcNdMatrixStride = nextOffset - offset;
+                        params.dstNzMatrixStride = run * S8_BLOCK_CUBE;
+                    }
+                }
+            }
+            DataCopy(keyL1_[(keyL1BufIdx_ % DOUBLE_BUF_NUM) * KEY_BUFFER_OFFSET + s2L1Offset * S8_BLOCK_CUBE],
+                     keyGm_[offset], params);
+            s2L1Offset += run * params.ndNum;
+        }
+        return;
+    }
+    if (false /* retired experimental path */) {
+        Nd2NzParams params;
+        params.ndNum = 1;
+        params.nValue = QLIV2Candidate::BLOCK;
+        params.dValue = params.srcDValue = constInfo_.headDim;
+        params.dstNzC0Stride = CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE);
+        params.dstNzNStride = 1;
+        params.srcNdMatrixStride = params.dstNzMatrixStride = 0;
+        for (; s2L1Offset < s2L1RealSize; s2L1Offset += QLIV2Candidate::BLOCK) {
+            uint32_t slot = (s2GmOffset + s2L1Offset) / QLIV2Candidate::BLOCK;
+            int32_t candidate = slot < QLIV2Candidate::PREFIX / QLIV2Candidate::BLOCK ? 0 :
+                candidatesGm_.GetValue(runInfo.candidateOutOffset + slot -
+                                      QLIV2Candidate::PREFIX / QLIV2Candidate::BLOCK);
+            int32_t block = QLIV2Candidate::OriginalBlock(slot, candidate, runInfo.candidateVisible);
+            if (block < 0) {
+                // These score columns are masked to -inf by Vector. Leaving
+                // their INT8 L1 rows unchanged avoids repeatedly gathering K[0].
+                continue;
+            }
+            uint32_t position = block * QLIV2Candidate::BLOCK;
+            uint64_t page = blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch +
+                                               position / constInfo_.kCacheBlockSize);
+            uint64_t offset = page * blkStride + (position % constInfo_.kCacheBlockSize) * constInfo_.headDim;
+            // ND2NZ permits nValue=8; D is 32-byte aligned. Every candidate
+            // lands in eight consecutive NZ rows of this 128-position tile.
+            DataCopy(keyL1_[(keyL1BufIdx_ % DOUBLE_BUF_NUM) * KEY_BUFFER_OFFSET +
+                            s2L1Offset * S8_BLOCK_CUBE], keyGm_[offset], params);
+        }
+        return;
+    }
     while (s2L1Offset < s2L1RealSize) {
         uint64_t s2BlkId = (s2L1Offset + s2GmOffset) / constInfo_.kCacheBlockSize;
         uint64_t s2BlkOffset = (s2L1Offset + s2GmOffset) % constInfo_.kCacheBlockSize;
@@ -389,9 +489,24 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::QueryNd2Nz(uint64_t s1gL1RealSize, c
     nd2nzPara.dstNzNStride = 1;
     nd2nzPara.srcNdMatrixStride = 0;
     nd2nzPara.dstNzMatrixStride = 0;
-    // 默认一块buf最多放两份
-    DataCopy(queryL1_[(qwL1Mte2BufIdx_ % DOUBLE_BUF_NUM) * QUERY_BUFFER_OFFSET], queryGm_[runInfo.tensorQueryOffset],
-             nd2nzPara);
+    if ((false /* retired experimental path */ || constInfo_.candidateMode == CANDIDATE_MODE_PACKED)) {
+        // The bucket's Q rows are packed in ascending original-query order.
+        // Keep the NZ channel pitch equal to the packed matrix M, not the group M.
+        nd2nzPara.nValue = constInfo_.gSize;
+        uint32_t packed = 0;
+        for (uint32_t query = 0; query < runInfo.groupQueries; ++query) {
+            if ((runInfo.queryMask & (1U << query)) == 0) {
+                continue;
+            }
+            DataCopy(queryL1_[(qwL1Mte2BufIdx_ % DOUBLE_BUF_NUM) * QUERY_BUFFER_OFFSET +
+                              packed * constInfo_.gSize * 32],
+                     queryGm_[runInfo.tensorQueryOffset + query * constInfo_.gSize * constInfo_.headDim], nd2nzPara);
+            ++packed;
+        }
+    } else {
+        DataCopy(queryL1_[(qwL1Mte2BufIdx_ % DOUBLE_BUF_NUM) * QUERY_BUFFER_OFFSET],
+                 queryGm_[runInfo.tensorQueryOffset], nd2nzPara);
+    }
 }
 
 // s1g, d

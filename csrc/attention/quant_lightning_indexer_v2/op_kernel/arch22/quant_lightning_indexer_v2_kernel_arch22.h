@@ -25,6 +25,7 @@
 #include "quant_lightning_indexer_v2_service_vector_arch22.h"
 #include "quant_lightning_indexer_v2_service_cube_arch22.h"
 #include "../quant_lightning_indexer_v2_metadata.h"
+#include "quant_lightning_indexer_v2_candidate_schedule.h"
 
 namespace QLIV2Kernel {
 using namespace QLIV2Common;
@@ -152,6 +153,10 @@ protected:
     __aicore__ inline uint32_t GetTotalBaseBlockNum();
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
+    __aicore__ inline void ProcessCandidate();
+    __aicore__ inline void ProcessGroupedCandidate();
+    __aicore__ inline void ProcessPreparedBlock(uint32_t loop,
+        QLIV2Common::RunInfo runInfo[LI_QUANT_PRELOAD_TASK_CACHE_SIZE]);
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                             QLIV2Common::RunInfo runInfo[LI_QUANT_PRELOAD_TASK_CACHE_SIZE]);
     __aicore__ inline void ProcessInvalid();
@@ -205,6 +210,10 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::InitTilingData(const QLIV2TilingDat
     constInfo.candidateMode = tilingData->candidateMode;
     constInfo.candidateTopkBlocks = tilingData->candidateTopkBlocks;
     constInfo.candidateBlockSize = tilingData->candidateBlockSize;
+    if (false /* retired experimental path */) {
+        constInfo.s1BaseSize = 1;
+        constInfo.mBaseSize = constInfo.gSize;
+    }
 }
 
 template <typename QLIV2T>
@@ -463,7 +472,41 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
     InitTilingData(tiling);
     InitActualSeqLen(cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK);
 
-    if (metadata != nullptr) {
+    // Benchmark only: mode 4 always uses direct candidate K, including prefill.
+
+    if (false /* retired experimental path */) {
+        uint32_t rows = actualSeqLengthsGmQ.GetValue(constInfo.batchSize);
+        QLIV2Candidate::Schedule schedule(rows, constInfo.candidateTopkBlocks, GetBlockNum());
+        constInfo.coreEnable = aiCoreIdx / schedule.parts < rows;
+        if ASCEND_IS_AIV {
+            ldInfo.isLdCoreEnable = schedule.parts > 1 && tmpBlockIdx < rows;
+            ldInfo.workspaceIdx = tmpBlockIdx * schedule.parts;
+            ldInfo.workspaceNum = schedule.parts;
+            ldInfo.mNum = 1;
+            ldInfo.indiceOutCoreOffset = static_cast<uint64_t>(tmpBlockIdx) * constInfo.sparseCount;
+        }
+    } else if ((false /* retired experimental path */ || constInfo.candidateMode == CANDIDATE_MODE_PACKED)) {
+        constInfo.coreEnable = true;
+        ldInfo.isLdCoreEnable = false;
+        candidateTopkIndexInGm.SetGlobalBuffer((__gm__ int32_t *)candidateTopkIndex);
+        uint32_t groups = candidateTopkIndexInGm.GetValue(6);
+        uint32_t parts = Max(1U, GetBlockNum() / groups);
+        if ASCEND_IS_AIV {
+            uint32_t group = tmpBlockIdx / 2;
+            if (parts > 1 && group < groups) {
+                uint64_t base = static_cast<uint64_t>(group) * QLIV2Candidate::GROUP_STRIDE;
+                uint32_t queries = candidateTopkIndexInGm.GetValue(base + 1);
+                ldInfo.mStart = (tmpBlockIdx % 2) * 2;
+                if (queries > ldInfo.mStart) {
+                    ldInfo.isLdCoreEnable = true;
+                    ldInfo.mNum = Min(2U, queries - ldInfo.mStart);
+                    ldInfo.workspaceIdx = group * parts;
+                    ldInfo.workspaceNum = Min(parts, static_cast<uint32_t>(candidateTopkIndexInGm.GetValue(base + 4)) / 64);
+                    ldInfo.indiceOutCoreOffset = static_cast<uint64_t>(candidateTopkIndexInGm.GetValue(base)) * constInfo.sparseCount;
+                }
+            }
+        }
+    } else if (metadata != nullptr) {
         metadataGm.SetGlobalBuffer((__gm__ uint32_t *)metadata);
         // 计算分核
         SplitCore();
@@ -492,6 +535,10 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
     vec1ResGm.SetGlobalBuffer((__gm__ float *)(workspace + offset));
     offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOUBLE * WS_DOUBLE * BASE_TOPK * sizeof(float);
 
+    if (false /* retired experimental path */ ||
+        (false /* retired experimental path */ || constInfo.candidateMode == CANDIDATE_MODE_PACKED)) {
+        candidateTopkIndexInGm.SetGlobalBuffer((__gm__ int32_t *)candidateTopkIndex);
+    }
     GlobalTensor<half> qScaleGm;
     GlobalTensor<half> kScaleGm;
     if ASCEND_IS_AIV {
@@ -501,10 +548,11 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
         qScaleGm.SetGlobalBuffer((__gm__ half *)queryScale);
         kScaleGm.SetGlobalBuffer((__gm__ half *)keyScale);
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
-        if (constInfo.candidateMode == CANDIDATE_MODE_CONSUMER && candidateTopkIndex != nullptr) {
+        if (((constInfo.candidateMode == CANDIDATE_MODE_CONSUMER || constInfo.candidateMode == CANDIDATE_MODE_LOCAL_CAP || constInfo.candidateMode == CANDIDATE_MODE_CACHED_MASK) ||
+             false /* retired experimental path */) && candidateTopkIndex != nullptr) {
             candidateTopkIndexInGm.SetGlobalBuffer((__gm__ int32_t *)candidateTopkIndex);
         }
-        if (constInfo.candidateMode == CANDIDATE_MODE_SOURCE && candidateTopkIndexOut != nullptr) {
+        if ((constInfo.candidateMode == CANDIDATE_MODE_SOURCE || constInfo.candidateMode == CANDIDATE_MODE_SOURCE_TOP512) && candidateTopkIndexOut != nullptr) {
             candidateTopkIndexOutGm.SetGlobalBuffer((__gm__ int32_t *)candidateTopkIndexOut);
         }
         if (outputIdxOffset != nullptr) {  // A15: 使能 output_idx_offset (参照 arch35)
@@ -524,6 +572,7 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
         }
         keyGm.SetGlobalBuffer((__gm__ K_T *)key);
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm, mm1ResGm, weightWorkspaceGm);
+        matmulService.InitCandidateTensor(candidateTopkIndexInGm);
     }
     InitBuffers();
 }
@@ -668,6 +717,14 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::CalcRunInfo(uint32_t loop, uint32_t
 template <typename QLIV2T>
 __aicore__ inline void QLIV2Preload<QLIV2T>::Process()
 {
+    if ((false /* retired experimental path */ || constInfo.candidateMode == CANDIDATE_MODE_PACKED)) {
+        ProcessGroupedCandidate();
+        return;
+    }
+    if (false /* retired experimental path */) {
+        ProcessCandidate();
+        return;
+    }
     // 没有计算任务，直接清理输出
     if (coreZeroEnable == 0) {
         ProcessInvalid();
@@ -676,6 +733,15 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Process()
     ProcessMain();
 
     ProcessDecode();
+    if ASCEND_IS_AIV {
+        if (false /* retired experimental path */ || constInfo.candidateMode == CANDIDATE_MODE_CACHED_MASK) {
+            uint32_t rows = actualSeqLengthsGmQ.GetValue(constInfo.batchSize);
+            for (uint32_t row = rows + tmpBlockIdx; row < constInfo.qSeqSize; row += GetBlockNum() * 2) {
+                GlobalTensor<int32_t> output = indiceOutGm[static_cast<uint64_t>(row) * constInfo.sparseCount];
+                InitGlobalMemory(output, constInfo.sparseCount, -1);
+            }
+        }
+    }
 }
 
 template <typename QLIV2T>
@@ -781,11 +847,17 @@ template <typename QLIV2T>
 __aicore__ inline void QLIV2Preload<QLIV2T>::ProcessBaseBlock(
     uint32_t loop, uint64_t s2LoopIdx, QLIV2Common::RunInfo runInfo[LI_QUANT_PRELOAD_TASK_CACHE_SIZE])
 {
+    CalcRunInfo(loop, s2LoopIdx, runInfo[loop % LI_QUANT_PRELOAD_TASK_CACHE_SIZE]);
+    ProcessPreparedBlock(loop, runInfo);
+}
+
+template <typename QLIV2T>
+__aicore__ inline void QLIV2Preload<QLIV2T>::ProcessPreparedBlock(
+    uint32_t loop, QLIV2Common::RunInfo runInfo[LI_QUANT_PRELOAD_TASK_CACHE_SIZE])
+{
     int32_t curTaskId = loop % LI_QUANT_PRELOAD_TASK_CACHE_SIZE;
     QLIV2Common::RunInfo &curRunInfo = runInfo[curTaskId];
     QLIV2Common::RunInfo &lastRunInfo = runInfo[1 - curTaskId];
-
-    CalcRunInfo(loop, s2LoopIdx, curRunInfo);
 
     if (curRunInfo.isValid) {
         if ASCEND_IS_AIC {
@@ -815,6 +887,198 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::ProcessBaseBlock(
             CrossCoreSetFlag<QLIV2Common::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1); // 反向同步 1
         }
         lastRunInfo.isValid = false;
+    }
+}
+
+template <typename QLIV2T>
+__aicore__ inline void QLIV2Preload<QLIV2T>::ProcessCandidate()
+{
+    uint32_t rows = actualSeqLengthsGmQ.GetValue(constInfo.batchSize);
+    QLIV2Candidate::Schedule schedule(rows, constInfo.candidateTopkBlocks, GetBlockNum());
+    uint32_t group = aiCoreIdx / schedule.parts;
+    uint32_t part = aiCoreIdx % schedule.parts;
+    if (group < rows && group < schedule.groups) {
+        if ASCEND_IS_AIV {
+            vectorService.AllocEventID();
+            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+        } else {
+            matmulService.AllocEventID();
+            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V0);
+            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V0);
+        }
+        RunInfo runs[LI_QUANT_PRELOAD_TASK_CACHE_SIZE];
+        uint32_t loop = 0;
+        uint32_t request = 0;
+        for (uint32_t row = group; row < rows; row += schedule.groups) {
+            while (row >= actualSeqLengthsGmQ.GetValue(request + 1)) {
+                ++request;
+            }
+            uint32_t end = actualSeqLengthsGmQ.GetValue(request + 1);
+            uint32_t length = GetActualSeqLen(request, constInfo.actualLenDims, false,
+                                              actualSeqLengthsGm, constInfo.kSeqSize);
+            // All tokens in a verification request have their own causal end.
+            int32_t visible = static_cast<int32_t>(length) - static_cast<int32_t>(end - row) + 1;
+            if (!constInfo.attenMaskFlag) {
+                visible = length;
+            }
+            for (uint32_t tile = schedule.Begin(part); tile < schedule.End(part); ++tile) {
+                RunInfo &info = runs[loop % LI_QUANT_PRELOAD_TASK_CACHE_SIZE];
+                info = RunInfo{};
+                info.isValid = true;
+                info.loop = loop;
+                info.bIdx = info.bN2Idx = request;
+                info.s2Idx = tile;
+                info.actS1Size = 1;
+                info.actMBaseSize = constInfo.gSize;
+                info.actS2Size = info.actS2SizeOrig = schedule.slots;
+                info.candidateVisible = visible > 0 ? visible : 0;
+                info.actualSingleProcessSInnerSize = Min(schedule.slots - tile * S2_BASE_SIZE, S2_BASE_SIZE);
+                info.actualSingleProcessSInnerSizeAlign = Align(info.actualSingleProcessSInnerSize, 32U);
+                info.isFirstS2InnerLoop = tile == schedule.Begin(part);
+                info.isLastS2InnerLoop = tile + 1 == schedule.End(part);
+                info.isNeedLD = schedule.parts > 1;
+                info.saveWorkSpaceIdx = row * schedule.parts + part;
+                info.tensorQueryOffset = static_cast<uint64_t>(row) * constInfo.gSize * constInfo.headDim;
+                info.tensorWeightsOffset = static_cast<uint64_t>(row) * constInfo.gSize;
+                info.indiceOutOffset = static_cast<uint64_t>(row) * constInfo.sparseCount;
+                info.candidateOutOffset = static_cast<uint64_t>(row) * constInfo.candidateTopkBlocks;
+                info.outputIdxOffsetCoreOffset = row;
+                ProcessPreparedBlock(loop++, runs);
+            }
+        }
+        runs[loop % LI_QUANT_PRELOAD_TASK_CACHE_SIZE].isValid = false;
+        ProcessPreparedBlock(loop, runs); // Drain the final Vector task.
+        if ASCEND_IS_AIV {
+            vectorService.FreeEventID();
+            CrossCoreWaitFlag(constInfo.syncC1V0);
+            CrossCoreWaitFlag(constInfo.syncC1V0);
+        } else {
+            matmulService.FreeEventID();
+            CrossCoreWaitFlag(constInfo.syncV1C1);
+            CrossCoreWaitFlag(constInfo.syncV1C1);
+        }
+    }
+    ProcessDecode();
+    if ASCEND_IS_AIV {
+        // TND graph buckets can have unused trailing query rows.
+        for (uint32_t row = rows + tmpBlockIdx; row < constInfo.qSeqSize; row += GetBlockNum() * 2) {
+            // InitLDBuffers has reset the normal queues; write padding directly.
+            GlobalTensor<int32_t> output = indiceOutGm[static_cast<uint64_t>(row) * constInfo.sparseCount];
+            InitGlobalMemory(output, constInfo.sparseCount, -1);
+        }
+    }
+}
+
+// Each core owns complete query groups, retaining each row's Top512 across
+// all union tiles. Plan construction is a separate device operation and is
+// included in end-to-end microbench timing.
+template <typename QLIV2T>
+__aicore__ inline void QLIV2Preload<QLIV2T>::ProcessGroupedCandidate()
+{
+    using namespace QLIV2Candidate;
+    uint32_t groups = candidateTopkIndexInGm.GetValue(6);
+    uint32_t parts = Max(1U, GetBlockNum() / groups);
+    if ASCEND_IS_AIV {
+        vectorService.AllocEventID();
+        CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+        CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+    } else {
+        matmulService.AllocEventID();
+        CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V0);
+        CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V0);
+    }
+    RunInfo runs[LI_QUANT_PRELOAD_TASK_CACHE_SIZE];
+    uint32_t loop = 0;
+    for (uint32_t task = aiCoreIdx; task < groups * parts; task += GetBlockNum()) {
+        uint32_t group = task / parts;
+        uint32_t part = task % parts;
+        uint64_t base = static_cast<uint64_t>(group) * GROUP_STRIDE;
+        uint32_t queryCount = candidateTopkIndexInGm.GetValue(base + 1);
+        if (queryCount == 0) {
+            continue;
+        }
+        uint32_t row = candidateTopkIndexInGm.GetValue(base);
+        uint32_t request = candidateTopkIndexInGm.GetValue(base + 2);
+        uint32_t visible = candidateTopkIndexInGm.GetValue(base + 3);
+        uint32_t units = candidateTopkIndexInGm.GetValue(base + 4) / 64;
+        uint32_t activeParts = Min(parts, units);
+        if (part >= activeParts) {
+            continue;
+        }
+        uint32_t partBegin = units * part / activeParts * 64;
+        uint32_t partEnd = units * (part + 1) / activeParts * 64;
+        uint32_t lastBucket = candidateTopkIndexInGm.GetValue(base + 5);
+        for (uint32_t bucket = 0; bucket <= lastBucket; ++bucket) {
+            uint32_t firstBlock = candidateTopkIndexInGm.GetValue(base + 8 + bucket * 2);
+            uint32_t bucketEnd = firstBlock + candidateTopkIndexInGm.GetValue(base + 9 + bucket * 2);
+            uint32_t validEnd = firstBlock + candidateTopkIndexInGm.GetValue(base + 40 + bucket);
+            firstBlock = Max(firstBlock, partBegin);
+            bucketEnd = Min(bucketEnd, partEnd);
+            if (bucketEnd <= firstBlock) {
+                continue;
+            }
+            uint32_t slots = (bucketEnd - firstBlock) * BLOCK;
+            // Bucket zero preserves the bounded shortage-fill prefix. All other
+            // buckets compute only the query subset in their membership mask.
+            uint32_t mask = bucket == 0 ? (1U << queryCount) - 1 : bucket;
+            uint32_t active = 0;
+            for (uint32_t query = 0; query < queryCount; ++query) {
+                active += (mask >> query) & 1U;
+            }
+            uint32_t tiles = CeilDiv(slots, S2_BASE_SIZE);
+            for (uint32_t tile = 0; tile < tiles; ++tile) {
+                RunInfo &info = runs[loop % LI_QUANT_PRELOAD_TASK_CACHE_SIZE];
+                info = RunInfo{};
+                info.isValid = true;
+                info.loop = loop;
+                info.bIdx = info.bN2Idx = request;
+                info.s2Idx = tile;
+                info.groupQueries = queryCount;
+                info.queryMask = mask;
+                info.prefixBucket = bucket == 0;
+                info.groupFirst = firstBlock == partBegin && tile == 0;
+                info.groupLast = bucketEnd == partEnd && tile + 1 == tiles;
+                info.isNeedLD = parts > 1;
+                info.saveWorkSpaceIdx = task;
+                info.actS1Size = active;
+                info.actMBaseSize = active * constInfo.gSize;
+                info.actS2Size = info.actS2SizeOrig = slots;
+                info.candidateVisible = visible;
+                uint32_t tokenCount = Min((Min(validEnd, bucketEnd) - firstBlock) * BLOCK - tile * S2_BASE_SIZE, S2_BASE_SIZE);
+                // SortAll accepts 128/256/384/512 then multiples of 512. Keep
+                // the metadata's 512-token bucket offsets, but do not compute
+                // all of that padding for rare membership combinations.
+                info.actualSingleProcessSInnerSize = tokenCount <= 512 ? Align(tokenCount, 128U) : Align(tokenCount, 512U);
+                info.actualSingleProcessSInnerSizeAlign = Align(info.actualSingleProcessSInnerSize, 32U);
+                info.isFirstS2InnerLoop = tile == 0;
+                info.isLastS2InnerLoop = tile + 1 == tiles;
+                info.tensorQueryOffset = static_cast<uint64_t>(row) * constInfo.gSize * constInfo.headDim;
+                info.tensorWeightsOffset = static_cast<uint64_t>(row) * constInfo.gSize;
+                info.indiceOutOffset = static_cast<uint64_t>(row) * constInfo.sparseCount;
+                info.candidateOutOffset = base + GROUP_HEADER + firstBlock;
+                ProcessPreparedBlock(loop++, runs);
+            }
+        }
+    }
+    runs[loop % LI_QUANT_PRELOAD_TASK_CACHE_SIZE].isValid = false;
+    ProcessPreparedBlock(loop, runs);
+    if ASCEND_IS_AIV {
+        vectorService.FreeEventID();
+        CrossCoreWaitFlag(constInfo.syncC1V0);
+        CrossCoreWaitFlag(constInfo.syncC1V0);
+        uint32_t rows = actualSeqLengthsGmQ.GetValue(constInfo.batchSize);
+        for (uint32_t row = rows + tmpBlockIdx; row < constInfo.qSeqSize; row += GetBlockNum() * 2) {
+            GlobalTensor<int32_t> output = indiceOutGm[static_cast<uint64_t>(row) * constInfo.sparseCount];
+            InitGlobalMemory(output, constInfo.sparseCount, -1);
+        }
+    } else {
+        matmulService.FreeEventID();
+        CrossCoreWaitFlag(constInfo.syncV1C1);
+        CrossCoreWaitFlag(constInfo.syncV1C1);
+    }
+    if (parts > 1) {
+        ProcessDecode();
     }
 }
 

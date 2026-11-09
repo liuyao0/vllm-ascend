@@ -428,11 +428,19 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
     uint32_t candidateMode = (opParamInfo_.candidateMode != nullptr) ?
                                  static_cast<uint32_t>(*opParamInfo_.candidateMode) : CANDIDATE_MODE_OFF;
     OP_CHECK_IF((candidateMode != CANDIDATE_MODE_SOURCE) && (candidateMode != CANDIDATE_MODE_CONSUMER) &&
-                    (candidateMode != CANDIDATE_MODE_OFF),
+                    (candidateMode != CANDIDATE_MODE_OFF) &&
+                    (candidateMode != CANDIDATE_MODE_PACKED) && (candidateMode != CANDIDATE_MODE_CACHED_MASK) && (candidateMode != CANDIDATE_MODE_SOURCE_TOP512) && (candidateMode != CANDIDATE_MODE_LOCAL_CAP),
                 OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "candidate_mode",
                                                       std::to_string(candidateMode),
-                                                      "Candidate_mode only supports 1(source), 2(consumer) or 3(off)"),
+                                                      "Candidate_mode supports 1(source), 2(consumer), 3(off), 7(packed grouped), 8(cached mask), 9(source token Top512), 10(local score caps)"),
                 return ge::GRAPH_FAILED);
+    if (candidateMode == CANDIDATE_MODE_DIRECT || candidateMode == CANDIDATE_MODE_LOCAL_CAP || candidateMode == CANDIDATE_MODE_CACHED_MASK || candidateMode == CANDIDATE_MODE_SOURCE_TOP512 || (candidateMode == CANDIDATE_MODE_GROUPED || candidateMode == CANDIDATE_MODE_PACKED)) {
+        OP_CHECK_IF(layout_query != "TND" || layout_key != "PA_BBND" ||
+                        *opParamInfo_.cmpRatio != 1 || *opParamInfo_.sparseCount != 512 ||
+                        opParamInfo_.outputIdxOffset.tensor != nullptr,
+                    OP_LOGE(opName_, "Direct candidate mode requires TND/PA_BBND, cmp_ratio=1, topk=512, no output offset."),
+                    return ge::GRAPH_FAILED);
+    }
     if (candidateMode != CANDIDATE_MODE_OFF) {
         // candidate 功能当前仅在 arch22 (910b/910_93) 实现
         OP_CHECK_IF(npuArch_ == NpuArch::DAV_3510,
@@ -470,11 +478,12 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
                                                           std::to_string(candBlkSize),
                                                           "Candidate_block_size only supports 8 currently"),
                     return ge::GRAPH_FAILED);
-        if (candidateMode == CANDIDATE_MODE_CONSUMER) {
+        if (candidateMode == CANDIDATE_MODE_CONSUMER || candidateMode == CANDIDATE_MODE_LOCAL_CAP || candidateMode == CANDIDATE_MODE_CACHED_MASK || candidateMode == CANDIDATE_MODE_DIRECT ||
+            (candidateMode == CANDIDATE_MODE_GROUPED || candidateMode == CANDIDATE_MODE_PACKED)) {
             OP_CHECK_IF(opParamInfo_.candidateTopkIndex.tensor == nullptr,
                         OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "candidate_topk_index",
                                                                  "candidate_topk_index input is required when "
-                                                                 "candidate_mode=2(consumer)"),
+                                                                 "candidate_mode=2 or 4 (consumer)"),
                         return ge::GRAPH_FAILED);
         }
     }
@@ -1722,8 +1731,10 @@ ge::graphStatus QuantLightningIndexerV2Tiling::DoTiling(QLIV2TilingInfo *tilingI
     workSpaces[0] = workspaceSize;
 
     // -------------set tilingdata-----------------
-    // candidate (two-level topk) 输入校验: mode=2 时 candidate_topk_index 必须为 [B, S1, N2, candBlocks] int32
-    if (tilingInfo->candidateMode == CANDIDATE_MODE_CONSUMER) {
+    // candidate (two-level topk) 输入校验: mode=2/4 时 candidate_topk_index 必须为 [B, S1, N2, candBlocks] int32
+    if ((tilingInfo->candidateMode == CANDIDATE_MODE_CONSUMER || tilingInfo->candidateMode == CANDIDATE_MODE_LOCAL_CAP || tilingInfo->candidateMode == CANDIDATE_MODE_CACHED_MASK) ||
+        tilingInfo->candidateMode == CANDIDATE_MODE_DIRECT ||
+        (tilingInfo->candidateMode == CANDIDATE_MODE_GROUPED || tilingInfo->candidateMode == CANDIDATE_MODE_PACKED)) {
         OP_CHECK_IF(tilingInfo->opParamInfo.candidateTopkIndex.desc == nullptr ||
                         tilingInfo->opParamInfo.candidateTopkIndex.desc->GetDataType() != ge::DT_INT32,
                     OP_LOGE("QuantLightningIndexerV2", "candidate_topk_index dtype only supports int32."),
@@ -1736,6 +1747,17 @@ ge::graphStatus QuantLightningIndexerV2Tiling::DoTiling(QLIV2TilingInfo *tilingI
         } else {
             expectSize = static_cast<int64_t>(tilingInfo->bSize) * tilingInfo->s1Size * tilingInfo->n2Size *
                          tilingInfo->candidateTopkBlocks;
+        }
+        if ((tilingInfo->candidateMode == CANDIDATE_MODE_GROUPED || tilingInfo->candidateMode == CANDIDATE_MODE_PACKED)) {
+            // Four-query plan: 16 header words, followed by origin, membership,
+            // and physical-token arrays. Reserve one boundary group per request.
+            int64_t rows = tilingInfo->opParamInfo.query.shape->GetStorageShape().GetDim(0);
+            expectSize = ((rows + 3) / 4 + tilingInfo->bSize) * (64 + 3 * (4 * 2048 + 16 * 64));
+        }
+        if (tilingInfo->candidateMode == CANDIDATE_MODE_CACHED_MASK) {
+            int64_t rows = tilingInfo->opParamInfo.query.shape->GetStorageShape().GetDim(0);
+            int64_t blocks = (tilingInfo->maxBlockNumPerBatch * tilingInfo->blockSize + 2047) / 2048 * 256 + 256;
+            expectSize = rows * blocks;
         }
         int64_t actualSize = tilingInfo->opParamInfo.candidateTopkIndex.tensor->GetShapeSize();
         OP_CHECK_IF(actualSize != expectSize,

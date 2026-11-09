@@ -21,6 +21,18 @@ namespace QLIV2Common {
 inline constexpr uint32_t CANDIDATE_MODE_SOURCE = 1;   // is_candidate_source: 输出候选块索引
 inline constexpr uint32_t CANDIDATE_MODE_CONSUMER = 2; // use_candidate: 输入候选块索引, 候选内选topk
 inline constexpr uint32_t CANDIDATE_MODE_OFF = 3;      // 关闭candidate功能(默认)
+inline constexpr uint32_t CANDIDATE_MODE_GROUPED = 6;
+inline constexpr uint32_t CANDIDATE_MODE_PACKED = 7;
+inline constexpr uint32_t CANDIDATE_MODE_CACHED_MASK = 8;
+inline constexpr uint32_t CANDIDATE_MODE_SOURCE_TOP512 = 9;
+inline constexpr uint32_t CANDIDATE_MODE_LOCAL_CAP = 10;
+inline constexpr uint32_t CANDIDATE_MODE_DIRECT = 4; // Candidate-only paged consumer (arch22, C1, TND).
+// Internal specialization of mode 4: contiguous QK with a sparse mask scatter.
+inline constexpr uint32_t CANDIDATE_MODE_DENSE_SCATTER = 5;
+// A2 measurements: small random DMA and fixed candidate slots outweigh the
+// saved QK work below this context, especially with holes in candidate rows.
+inline constexpr uint32_t CANDIDATE_DIRECT_MIN_CONTEXT = 65536;
+inline constexpr uint32_t CANDIDATE_DIRECT_MAX_ROWS = 32;
 
 // 与tiling的layout保持一致
 enum class LI_LAYOUT : uint32_t {
@@ -69,6 +81,12 @@ struct RunInfo {
     bool isValid = false;
     bool isNeedLD = false;
     uint32_t saveWorkSpaceIdx = 0;
+    uint32_t groupQueries = 0;
+    uint32_t queryMask = 0;
+    bool groupFirst = false;
+    bool groupLast = false;
+    bool prefixBucket = false;
+    uint32_t candidateVisible = 0; // Original causal length, separate from virtual S2 slots.
 };
 
 struct ConstInfo {
@@ -122,7 +140,7 @@ struct ConstInfo {
     bool isAccumSeqS2 = false;        // 是否累加模式
 
     // candidate (two-level topk)
-    uint32_t candidateMode = 3U;        // 1=source 2=consumer 3=off
+    uint32_t candidateMode = 3U;        // 1=source 2=consumer 3=off 4=direct consumer
     uint32_t candidateTopkBlocks = 2048U;
     uint32_t candidateBlockSize = 8U;
 
