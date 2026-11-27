@@ -79,11 +79,11 @@ W4A8; W8A8 alternatives and their PD layouts are listed in the table.
 For A2/A3, you can also use [ModelSlim](https://github.com/Ascend/msmodelslim)
 to prepare a compatible W8A8 checkpoint from the official weights.
 
-On A2/A3, set `"dsv41_int8_long_kv": true` in `--additional-config` to
+For worker-local KV on A2/A3 with Model Runner V2, set `"dsv41_int8_long_kv": true` in `--additional-config` to
 store C1/C2 long-context KV in INT8. Each post-RoPE 512-channel row uses
 eight FP32 scales, one per 64 channels, for 544 bytes per compressed position.
 SparseFlashMla reads selected rows in this format. The default long KV format
-is BF16. In a PD deployment, set the same format on both stages.
+is BF16. The INT8 option requires PP=1 and DCP=1 with KV transfer, KVPP and sparse KV offload disabled.
 
 With 8 local query heads, 1 KV head and TopK 512, the same option enables grouped
 INT8 reads for batches of up to 256 query tokens in `vllm serve`. Each group shares
@@ -98,9 +98,7 @@ to verify the selected INT8 rows and all 38 attention outputs in the two-slot po
 Build and install the grouped kernels and OPP from the same patched checkout
 as the Python worker.
 
-For worker-local KV on Model Runner V2, add `"dsv41_int8_long_kv": true` and
-`"layer_packed_kv_cache": true` to the existing additional configuration.
-All cache groups allocate block IDs from one pool. The four long KV sources
+With INT8 enabled, all cache groups allocate block IDs from one pool. The four long KV sources
 and their indexers occupy two physical slots. With 128-token blocks, each
 slot uses 128 KiB. SWA keeps BF16 and C2 ring state keeps FP32. Restart the
 workers to allocate this layout. PCP replicates the same layout on each rank.

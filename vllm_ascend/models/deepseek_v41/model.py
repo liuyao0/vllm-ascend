@@ -931,7 +931,6 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         width = config.head_dim
         self.softmax_scale = width**-0.5
         if role.is_kv_source:
-            ascend_config = get_ascend_config()
             self.long_kv_cache = DeepseekV41CacheLayer(
                 vllm_config,
                 f"{prefix}.long_kv_cache",
@@ -939,8 +938,7 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
                     block_size=block_size,
                     head_size=width,
                     compress_ratio=role.compress_ratio,
-                    int8_long_kv=ascend_config.dsv41_int8_long_kv,
-                    layer_packed=ascend_config.layer_packed_kv_cache,
+                    int8_long_kv=get_ascend_config().dsv41_int8_long_kv,
                 ),
             )
         self.compressor = (

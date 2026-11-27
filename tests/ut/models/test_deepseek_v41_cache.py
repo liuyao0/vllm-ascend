@@ -286,8 +286,8 @@ def test_twelve_groups_share_four_layer_slots(config, runtime):
 
 
 @pytest.mark.parametrize("block_size", [32, 64, 128])
-@pytest.mark.parametrize("layer_packed", [False, True])
-def test_g64_long_kv_page_allocation(config, runtime, monkeypatch, block_size, layer_packed):
+@pytest.mark.parametrize("int8_long_kv", [False, True])
+def test_long_kv_page_allocation(config, runtime, monkeypatch, block_size, int8_long_kv):
     from vllm_ascend.models.deepseek_v41 import cache_config
 
     monkeypatch.setattr(cache_config, "uses_a5_packed_cache", lambda: False)
@@ -300,8 +300,7 @@ def test_g64_long_kv_page_allocation(config, runtime, monkeypatch, block_size, l
                 block_size=block_size,
                 head_size=512,
                 compress_ratio=spec.tokens_per_state,
-                int8_long_kv=True,
-                layer_packed=layer_packed,
+                int8_long_kv=int8_long_kv,
             )
     groups = make_cache_groups(group_cache_specs(specs))
     total = get_deepseek_v41_pool_bytes_per_block(groups)
@@ -311,9 +310,10 @@ def test_g64_long_kv_page_allocation(config, runtime, monkeypatch, block_size, l
         if name.endswith(".long_kv_cache"):
             index_k, index_scale = views[name.removesuffix(".long_kv_cache") + ".indexer.k_cache"]
             physical_rows = block_size // specs[name].tokens_per_state
-            assert tensor.shape == (2, physical_rows, 1, 544)
-            assert tensor.dtype == torch.int8
-            assert index_k.data_ptr() - tensor.data_ptr() == physical_rows * 544
+            assert specs[name].layer_packed == int8_long_kv
+            assert tensor.shape == (2, physical_rows, 1, 544 if int8_long_kv else 512)
+            assert tensor.dtype == (torch.int8 if int8_long_kv else torch.bfloat16)
+            assert index_k.data_ptr() - tensor.data_ptr() == physical_rows * tensor.shape[-1] * tensor.element_size()
             assert index_scale.dtype == torch.float16
         elif name.endswith(".swa_cache"):
             assert tensor.shape[-1] == 512 and tensor.dtype == torch.bfloat16

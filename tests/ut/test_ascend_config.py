@@ -66,13 +66,17 @@ def test_layer_packed_kv_accepts_pcp4_tp2_but_rejects_kv_transfer():
     config.parallel_config.prefill_context_parallel_size = 4
     config.parallel_config.tensor_parallel_size = 2
     enabled = AscendConfig(
-        layer_packed_kv_cache=True,
         dsv41_int8_long_kv=True,
         sparse_kv_offload_config=SparseKVOffloadConfig(),
     )
+    with (
+        patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=False),
+        pytest.raises(ValueError, match="Model Runner V2"),
+    ):
+        enabled.derive_and_validate(config)
     with patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=True):
         enabled.derive_and_validate(config)
-        assert enabled.layer_packed_kv_cache
+        assert enabled.dsv41_int8_long_kv
         config.kv_transfer_config = KVTransferConfig(kv_connector="ExampleConnector", kv_role="kv_both")
         with pytest.raises(ValueError, match="KV transfer"):
             enabled.derive_and_validate(config)

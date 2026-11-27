@@ -303,7 +303,6 @@ def make_cache_config(num_blocks, *, block_size=128, head_size=512, index_size=1
                     head_size=head_size,
                     compress_ratio=spec.tokens_per_state,
                     int8_long_kv=True,
-                    layer_packed=True,
                 )
     for stage in range(draft_layers):
         specs[f"mtp.{stage}.self_attn.swa_cache"] = AscendSlidingWindowMLASpec(

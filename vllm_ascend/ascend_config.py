@@ -699,9 +699,7 @@ class AscendConfig:
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     dsv41_int8_long_kv: bool = False
-    """Store V4.1 A2/A3 compressed KV as INT8 with one FP32 scale per 64 channels."""
-    layer_packed_kv_cache: bool = False
-    """Pack V4.1 long sources and pairs of short-cache layers into one shared block pool."""
+    """Store G64 INT8 long KV in the V4.1 worker-local, layer-packed cache on A2/A3."""
     kv_trace: KVTraceConfig = dataclasses.field(default_factory=KVTraceConfig)
     kv_pool_range_debug: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -831,9 +829,9 @@ class AscendConfig:
     # pydantic after-validator). Preserves the original __init__ ordering —
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
-        if self.layer_packed_kv_cache:
-            if not self.dsv41_int8_long_kv or not vc.use_v2_model_runner:
-                raise ValueError("layer_packed_kv_cache requires dsv41_int8_long_kv and Model Runner V2.")
+        if self.dsv41_int8_long_kv:
+            if not vc.use_v2_model_runner:
+                raise ValueError("dsv41_int8_long_kv requires Model Runner V2.")
             parallel = vc.parallel_config
             if (
                 parallel.pipeline_parallel_size != 1

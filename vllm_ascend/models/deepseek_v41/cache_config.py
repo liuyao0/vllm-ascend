@@ -67,7 +67,7 @@ def make_swa_cache_spec(*, block_size, window_size, head_size, dtype, cache_dtyp
     )
 
 
-def make_mla_cache_spec(*, block_size, head_size, compress_ratio, int8_long_kv=False, layer_packed=False):
+def make_mla_cache_spec(*, block_size, head_size, compress_ratio, int8_long_kv=False):
     if int8_long_kv:
         if uses_a5_packed_cache() or head_size != MLA_HEAD_DIM:
             raise ValueError("INT8 G64 long KV requires A2/A3 and a 512-channel V4.1 head")
@@ -95,7 +95,7 @@ def make_mla_cache_spec(*, block_size, head_size, compress_ratio, int8_long_kv=F
         # Both supported vLLM lanes (#57169) omit MLA `storage_block_size`.
         **{},
         scale_dtype=scale_dtype,
-        layer_packed=layer_packed,
+        layer_packed=int8_long_kv,
     )
 
 

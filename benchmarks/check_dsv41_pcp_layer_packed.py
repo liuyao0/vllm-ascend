@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare two G64 cache layouts on eight local A3 devices with PCP4/TP2."""
+"""Check G64 prefix reuse against recomputation on eight local A3 devices with PCP4/TP2."""
 
 import argparse
 import random
 
 
-def run(model, layer_packed):
+def run(model, prefix_caching):
     from vllm import SamplingParams
 
     from tests.e2e.conftest import VllmRunner
@@ -28,12 +28,12 @@ def run(model, layer_packed):
         block_size=128,
         max_num_batched_tokens=512,
         max_num_seqs=4,
-        enable_prefix_caching=True,
+        enable_prefix_caching=prefix_caching,
         enable_expert_parallel=True,
         seed=37,
         engram_config={"cpu_offload": True},
         compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
-        additional_config={"dsv41_int8_long_kv": True, "layer_packed_kv_cache": layer_packed},
+        additional_config={"dsv41_int8_long_kv": True},
     ) as runner:
         for prompts in (first, revisit):
             outputs = runner.model.generate(prompts, params, use_tqdm=False)
@@ -41,7 +41,7 @@ def run(model, layer_packed):
             for output in outputs:
                 ids = list(output.outputs[0].token_ids)
                 assert output.finished and len(ids) == params.max_tokens
-                if prompts is revisit:
+                if prefix_caching and prompts is revisit:
                     assert output.num_cached_tokens > 0, "Revisited prefix missed"
                 results.append(ids)
     return results
@@ -51,8 +51,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", help="Local DSV4.1 Flash ModelSlim W4A8 checkpoint")
     model_path = parser.parse_args().model
-    baseline = run(model_path, layer_packed=False)
-    packed = run(model_path, layer_packed=True)
+    baseline = run(model_path, prefix_caching=False)
+    packed = run(model_path, prefix_caching=True)
     for request, (expected, actual) in enumerate(zip(baseline, packed, strict=True)):
         assert actual == expected, (request, expected, actual)
     print("PCP4/TP2: all six completions match, including three prefix-cache revisits.")
